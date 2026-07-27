@@ -2821,6 +2821,15 @@ pub(crate) fn get_row(range: &[u8]) -> Result<u32, XlsxError> {
     get_row_and_optional_column(range).map(|(row, _)| row)
 }
 
+/// Appends one base-26 letter to a 1-based column accumulator.
+///
+/// `offset` is the letter's position in the alphabet, i.e. `c - b'A'`.
+fn push_column_letter(col: u32, offset: u8) -> Result<u32, XlsxError> {
+    col.checked_mul(26)
+        .and_then(|col| col.checked_add(u32::from(offset) + 1))
+        .ok_or(XlsxError::ColumnNumberOverflow)
+}
+
 /// Converts a text-based range name into its `(row, column)` position (0-based index).
 /// If the column component of the range is missing, a None is returned (for the column).
 /// If the row component of the range is missing, an Error is returned.
@@ -2832,13 +2841,19 @@ fn get_row_and_optional_column(range: &[u8]) -> Result<(u32, Option<u32>), XlsxE
     // (eg: A=1, B=2, ..., Z=26, AA=27, ..., AZ=52, ..., etc)
     let mut col: u32 = 0;
     let mut row: u32 = 0;
+    // Both accumulations below are checked. The reference comes straight out
+    // of the file, and 7 letters or 11 digits are enough to leave `u32`, which
+    // panicked in a debug build and wrapped to an unrelated position in a
+    // release one. A value that merely exceeds the sheet limits is still
+    // accepted, deliberately: writers do not always respect them, so
+    // `get_dimension` warns rather than failing (see #174).
     while i < len {
         match range[i] {
-            c @ b'A'..=b'Z' => col = col * 26 + (c - b'A') as u32 + 1,
-            c @ b'a'..=b'z' => col = col * 26 + (c - b'a') as u32 + 1,
+            c @ b'A'..=b'Z' => col = push_column_letter(col, c - b'A')?,
+            c @ b'a'..=b'z' => col = push_column_letter(col, c - b'a')?,
             c @ b'0'..=b'9' => {
                 // on first digit, capture it and transition to the row loop
-                row = (c - b'0') as u32;
+                row = u32::from(c - b'0');
                 i += 1;
                 break;
             }
@@ -2850,7 +2865,12 @@ fn get_row_and_optional_column(range: &[u8]) -> Result<(u32, Option<u32>), XlsxE
     // Row: accumulate base-10 from remaining digits (1-based in source)
     while i < len {
         match range[i] {
-            c @ b'0'..=b'9' => row = row * 10 + (c - b'0') as u32,
+            c @ b'0'..=b'9' => {
+                row = row
+                    .checked_mul(10)
+                    .and_then(|row| row.checked_add(u32::from(c - b'0')))
+                    .ok_or(XlsxError::RowNumberOverflow)?;
+            }
             c => return Err(XlsxError::Alphanumeric(c)),
         }
         i += 1;
@@ -4008,6 +4028,40 @@ mod tests {
             get_dimension(b"A1:XFD1048576").unwrap().len(),
             17_179_869_184
         );
+    }
+
+    #[test]
+    fn test_cell_reference_overflow_is_an_error() {
+        // A reference comes straight out of the file, so the accumulators have
+        // to be checked. These used to panic in a debug build ("attempt to
+        // multiply with overflow") and wrap in a release one: `ZZZZZZZ`
+        // produced column 4_058_115_285, and `A99999999999` a cell at row
+        // 1_215_752_190, a position that appears nowhere in the file.
+        assert!(matches!(
+            get_row_column(b"ZZZZZZZ1"),
+            Err(XlsxError::ColumnNumberOverflow)
+        ));
+        assert!(matches!(
+            get_row_column(b"A99999999999"),
+            Err(XlsxError::RowNumberOverflow)
+        ));
+        assert!(matches!(
+            get_dimension(b"A1:ZZZZZZZ1"),
+            Err(XlsxError::ColumnNumberOverflow)
+        ));
+        assert!(matches!(
+            get_dimension(b"A1:A99999999999"),
+            Err(XlsxError::RowNumberOverflow)
+        ));
+
+        // The widest and tallest legal references still parse, as does the
+        // largest column that fits without overflowing, which is beyond the
+        // sheet limit but is accepted on purpose (#174).
+        assert_eq!(
+            get_row_column(b"XFD1048576").unwrap(),
+            (MAX_ROWS - 1, MAX_COLUMNS - 1)
+        );
+        assert_eq!(get_row_column(b"ZZZZZZ1").unwrap(), (0, 321_272_405));
     }
 
     #[test]
