@@ -177,9 +177,20 @@ impl Dimensions {
     pub fn contains(&self, row: u32, col: u32) -> bool {
         row >= self.start.0 && row <= self.end.0 && col >= self.start.1 && col <= self.end.1
     }
-    /// len
+    /// Number of cells covered by the area.
+    ///
+    /// Returns 0 for a degenerate area, i.e. one whose `end` precedes its
+    /// `start` on either axis. `Dimensions` is public and constructible
+    /// directly, and worksheets do carry reversed declarations, so this cannot
+    /// assume the corners are ordered: subtracting them the wrong way round
+    /// underflows, which panics in a debug build and wraps silently in a
+    /// release one.
     pub fn len(&self) -> u64 {
-        (self.end.0 - self.start.0 + 1) as u64 * (self.end.1 - self.start.1 + 1) as u64
+        if self.end.0 < self.start.0 || self.end.1 < self.start.1 {
+            return 0;
+        }
+        // Widened before the `+ 1` so a full-width axis cannot overflow either.
+        (u64::from(self.end.0 - self.start.0) + 1) * (u64::from(self.end.1 - self.start.1) + 1)
     }
 }
 

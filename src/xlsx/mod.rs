@@ -2789,18 +2789,22 @@ pub(crate) fn get_dimension(dimension: &[u8]) -> Result<Dimensions, XlsxError> {
             end: parts[0],
         }),
         2 => {
-            let rows = parts[1].0 - parts[0].0;
-            let columns = parts[1].1 - parts[0].1;
+            // A `ref` is not required to be ordered, and writers do emit
+            // reversed ones such as `C5:A1`. Normalise the corners so the rest
+            // of the crate can rely on `start <= end`; subtracting them the
+            // other way round underflows, which panics in a debug build and
+            // wraps silently in a release one.
+            let start = (parts[0].0.min(parts[1].0), parts[0].1.min(parts[1].1));
+            let end = (parts[0].0.max(parts[1].0), parts[0].1.max(parts[1].1));
+            let rows = end.0 - start.0;
+            let columns = end.1 - start.1;
             if rows > MAX_ROWS {
                 warn!("xlsx has more than maximum number of rows ({rows} > {MAX_ROWS})");
             }
             if columns > MAX_COLUMNS {
                 warn!("xlsx has more than maximum number of columns ({columns} > {MAX_COLUMNS})");
             }
-            Ok(Dimensions {
-                start: parts[0],
-                end: parts[1],
-            })
+            Ok(Dimensions { start, end })
         }
         len => Err(XlsxError::DimensionCount(len)),
     }
@@ -4008,6 +4012,47 @@ mod tests {
             get_dimension(b"A1:XFD1048576").unwrap().len(),
             17_179_869_184
         );
+    }
+
+    #[test]
+    fn test_reversed_dimension_is_normalised() {
+        // ECMA-376 does not require `ref` to be ordered. A reversed one used to
+        // underflow the extent arithmetic: `C5:A1` panicked in a debug build,
+        // and in a release build produced `start: (4, 2), end: (0, 0)`, whose
+        // `len()` was then 18_446_744_056_529_682_435.
+        let reversed = get_dimension(b"C5:A1").unwrap();
+        assert_eq!(
+            reversed,
+            Dimensions {
+                start: (0, 0),
+                end: (4, 2),
+            }
+        );
+        assert_eq!(reversed, get_dimension(b"A1:C5").unwrap());
+        assert_eq!(reversed.len(), 15);
+
+        // Reversed on one axis only.
+        assert_eq!(
+            get_dimension(b"A5:C1").unwrap(),
+            get_dimension(b"A1:C5").unwrap()
+        );
+        assert_eq!(
+            get_dimension(b"C1:A5").unwrap(),
+            get_dimension(b"A1:C5").unwrap()
+        );
+    }
+
+    #[test]
+    fn test_degenerate_dimensions_length_is_zero() {
+        // `Dimensions` is public and constructible directly, so `len()` has to
+        // be total rather than relying on `get_dimension` normalising first.
+        assert_eq!(Dimensions::new((4, 2), (0, 0)).len(), 0);
+        assert_eq!(Dimensions::new((0, 2), (4, 0)).len(), 0);
+        assert_eq!(Dimensions::new((4, 0), (0, 2)).len(), 0);
+        // A single cell is still one cell, and a full-width axis does not
+        // overflow the `+ 1`.
+        assert_eq!(Dimensions::new((7, 7), (7, 7)).len(), 1);
+        assert_eq!(Dimensions::new((0, 0), (u32::MAX, 0)).len(), 4_294_967_296);
     }
 
     #[test]
