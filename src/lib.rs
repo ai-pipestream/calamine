@@ -169,27 +169,20 @@ pub struct Dimensions {
 
 #[allow(clippy::len_without_is_empty)]
 impl Dimensions {
-    /// create dimensions info with start position and end position
+    /// Create a `Dimensions` instance with start and end cell positions.
     pub fn new(start: (u32, u32), end: (u32, u32)) -> Self {
-        Self { start, end }
+        Self {
+            start: (start.0.min(end.0), start.1.min(end.1)),
+            end: (start.0.max(end.0), start.1.max(end.1)),
+        }
     }
-    /// check if a position is in it
+    /// Check if a cell position is within the `Dimensions` range.
     pub fn contains(&self, row: u32, col: u32) -> bool {
         row >= self.start.0 && row <= self.end.0 && col >= self.start.1 && col <= self.end.1
     }
-    /// Number of cells covered by the area.
-    ///
-    /// Returns 0 for a degenerate area, i.e. one whose `end` precedes its
-    /// `start` on either axis. `Dimensions` is public and constructible
-    /// directly, and worksheets do carry reversed declarations, so this cannot
-    /// assume the corners are ordered: subtracting them the wrong way round
-    /// underflows, which panics in a debug build and wraps silently in a
-    /// release one.
+    /// Get the `len()` of the `Dimensions` range, which is equivalent to the cell area.
     pub fn len(&self) -> u64 {
-        if self.end.0 < self.start.0 || self.end.1 < self.start.1 {
-            return 0;
-        }
-        // Widened before the `+ 1` so a full-width axis cannot overflow either.
+        // Widened before the `+ 1` so a full-width axis cannot overflow.
         (u64::from(self.end.0 - self.start.0) + 1) * (u64::from(self.end.1 - self.start.1) + 1)
     }
 }
@@ -550,7 +543,7 @@ impl CellType for usize {} // for tests
 /// ];
 ///
 /// // Create a Range from the cells.
-/// let range = Range::from_sparse(cells);
+/// let range = Range::from_sparse(cells).unwrap();
 ///
 /// // Iterate over the cells in the range.
 /// for (row, col, data) in range.cells() {
@@ -696,6 +689,40 @@ pub struct Range<T> {
     end: (u32, u32),
     inner: Vec<T>,
 }
+
+/// An error for when a [`Range`] cannot be allocated.
+///
+/// A `Range` is dense, so the extent implied by the cell positions decides
+/// the allocation, not the number of cells supplied.
+#[derive(Debug)]
+pub struct RangeError {
+    width: u64,
+    height: u64,
+}
+
+impl RangeError {
+    /// The implied width of the range.
+    pub fn width(&self) -> u64 {
+        self.width
+    }
+
+    /// The implied height of the range.
+    pub fn height(&self) -> u64 {
+        self.height
+    }
+}
+
+impl std::fmt::Display for RangeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Cannot allocate a {} x {} range",
+            self.height, self.width
+        )
+    }
+}
+
+impl std::error::Error for RangeError {}
 
 impl<T: CellType> Range<T> {
     /// Creates a new `Range` with default values.
@@ -928,14 +955,10 @@ impl<T: CellType> Range<T> {
     ///
     /// - `cells`: A vector of [`Cell`] elements.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// The resulting `Range` is dense, so it holds
-    /// `(max_row - min_row + 1) * (max_col - min_col + 1)` cells regardless of
-    /// how many were supplied. Two cells at opposite corners of a worksheet
-    /// therefore imply a very large allocation: `A1` together with
-    /// `XFD1048576` is 17,179,869,184 cells. This function panics if that
-    /// allocation cannot be satisfied, rather than aborting the process.
+    /// Returns [`RangeError`] if the dense range implied by the cell positions
+    /// is too large to allocate.
     ///
     /// # Examples
     ///
@@ -951,7 +974,7 @@ impl<T: CellType> Range<T> {
     ///     Cell::new((9, 2), Data::Int(1)),
     /// ];
     ///
-    /// let range = Range::from_sparse(cells);
+    /// let range = Range::from_sparse(cells).unwrap();
     ///
     /// assert_eq!(range.width(), 1);
     /// assert_eq!(range.height(), 8);
@@ -959,9 +982,9 @@ impl<T: CellType> Range<T> {
     /// assert_eq!(range.used_cells().count(), 3);
     /// ```
     ///
-    pub fn from_sparse(cells: Vec<Cell<T>>) -> Range<T> {
+    pub fn from_sparse(cells: Vec<Cell<T>>) -> Result<Range<T>, RangeError> {
         if cells.is_empty() {
-            return Range::empty();
+            return Ok(Range::empty());
         }
         // cells do not always appear in (row, col) order
         // search bounds
@@ -975,28 +998,15 @@ impl<T: CellType> Range<T> {
             col_start = min(c, col_start);
             col_end = max(c, col_end);
         }
-        // Widened before the `+ 1`: an extent spanning a full `u32` axis would
-        // overflow otherwise, and `usize` is 32 bits on wasm32.
+        // Widened before the `+ 1` so a full `u32` axis cannot overflow.
         let width = u64::from(col_end - col_start) + 1;
         let height = u64::from(row_end - row_start) + 1;
         let size = width.saturating_mul(height);
 
-        // The extent comes from the cell positions in the file, so two cells
-        // far apart imply an allocation nobody asked for: a sheet holding only
-        // `A1` and `XFD1048576` densifies to 17_179_869_184 cells. Reserve
-        // fallibly, because a plain `vec![T::default(); len]` that cannot be
-        // satisfied calls `handle_alloc_error`, which aborts the process
-        // without unwinding and so cannot be caught by the caller at all.
         let mut v = Vec::new();
         let len = match usize::try_from(size) {
             Ok(len) if v.try_reserve_exact(len).is_ok() => len,
-            _ => panic!(
-                "calamine: cannot densify a {height} x {width} range \
-                 ({size} cells of {} bytes). This extent is derived from the \
-                 positions of the cells in the file, not from its declared \
-                 dimension, so a sheet with very few cells can still reach it.",
-                std::mem::size_of::<T>()
-            ),
+            _ => return Err(RangeError { width, height }),
         };
         v.resize(len, T::default());
         let cols = width as usize;
@@ -1009,11 +1019,11 @@ impl<T: CellType> Range<T> {
                 *v = c.val;
             }
         }
-        Range {
+        Ok(Range {
             start: (row_start, col_start),
             end: (row_end, col_end),
             inner: v,
-        }
+        })
     }
 
     /// Set a value at an absolute position in a `Range`.
@@ -1200,7 +1210,7 @@ impl<T: CellType> Range<T> {
     /// ];
     ///
     /// // Create a Range from the cells.
-    /// let range = Range::from_sparse(cells);
+    /// let range = Range::from_sparse(cells).unwrap();
     ///
     /// // Iterate over the rows of the range.
     /// for (row_num, row) in range.rows().enumerate() {
@@ -1256,7 +1266,7 @@ impl<T: CellType> Range<T> {
     /// ];
     ///
     /// // Create a Range from the cells.
-    /// let range = Range::from_sparse(cells);
+    /// let range = Range::from_sparse(cells).unwrap();
     ///
     /// // Iterate over the used cells in the range.
     /// for (row, col, data) in range.used_cells() {
@@ -1300,7 +1310,7 @@ impl<T: CellType> Range<T> {
     /// ];
     ///
     /// // Create a Range from the cells.
-    /// let range = Range::from_sparse(cells);
+    /// let range = Range::from_sparse(cells).unwrap();
     ///
     /// // Iterate over the cells in the range.
     /// for (row, col, data) in range.cells() {
@@ -1633,7 +1643,7 @@ impl<T: CellType> IndexMut<(usize, usize)> for Range<T> {
 /// ];
 ///
 /// // Create a Range from the cells.
-/// let range = Range::from_sparse(cells);
+/// let range = Range::from_sparse(cells).unwrap();
 ///
 /// // Use the Cells iterator returned by Range::cells().
 /// for (row, col, data) in range.cells() {
@@ -1702,7 +1712,7 @@ impl<'a, T: 'a + CellType> ExactSizeIterator for Cells<'a, T> {}
 /// ];
 ///
 /// // Create a Range from the cells.
-/// let range = Range::from_sparse(cells);
+/// let range = Range::from_sparse(cells).unwrap();
 ///
 /// // Use the UsedCells iterator returned by Range::used_cells().
 /// for (row, col, data) in range.used_cells() {
@@ -1773,7 +1783,7 @@ impl<'a, T: 'a + CellType> DoubleEndedIterator for UsedCells<'a, T> {
 /// ];
 ///
 /// // Create a Range from the cells.
-/// let range = Range::from_sparse(cells);
+/// let range = Range::from_sparse(cells).unwrap();
 ///
 /// // Use the Rows iterator returned by Range::rows().
 /// for (row_num, row) in range.rows().enumerate() {

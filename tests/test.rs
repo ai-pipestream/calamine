@@ -2849,28 +2849,28 @@ fn test_oom_allocation() {
 }
 
 #[test]
-#[should_panic(expected = "cannot densify")]
-fn from_sparse_oversized_extent_panics_rather_than_aborting() {
-    // A `Range` is dense, so the extent implied by the cell positions decides
-    // the allocation, not the number of cells supplied. `A1` together with
-    // `XFD1048576` is 17_179_869_184 cells, which used to reach
-    // `handle_alloc_error` and abort the process without unwinding, so a caller
-    // could not catch it at all.
+fn from_sparse_oversized_extent_returns_an_error() {
+    // `A1` together with `XFD1048576` implies 17_179_869_184 cells, which
+    // cannot be allocated.
     let cells = vec![
         calamine::Cell::new((0, 0), Float(1.0)),
         calamine::Cell::new((1_048_575, 16_383), Float(2.0)),
     ];
-    let _ = Range::from_sparse(cells);
+    let err = Range::from_sparse(cells).unwrap_err();
+    assert_eq!(err.width(), 16_384);
+    assert_eq!(err.height(), 1_048_576);
+    let msg = err.to_string();
+    assert!(msg.contains("1048576") && msg.contains("16384"), "{msg}");
 }
 
 #[test]
 fn from_sparse_keeps_working_for_a_sparse_but_sane_extent() {
-    // The guard must not disturb ordinary sparse input. Two cells 1000 rows and
-    // 100 columns apart densify to 100_000 cells, which is fine.
+    // Two cells 1000 rows and 100 columns apart densify to 100_000 cells.
     let range = Range::from_sparse(vec![
         calamine::Cell::new((0, 0), Float(1.0)),
         calamine::Cell::new((999, 99), Float(2.0)),
-    ]);
+    ])
+    .unwrap();
     assert_eq!((range.height(), range.width()), (1000, 100));
     assert_eq!(range.get((0, 0)), Some(&Float(1.0)));
     assert_eq!(range.get((999, 99)), Some(&Float(2.0)));
@@ -2880,6 +2880,18 @@ fn from_sparse_keeps_working_for_a_sparse_but_sane_extent() {
     let mut xlsx: Xlsx<_> = wb("issue_174.xlsx");
     let range = xlsx.worksheet_range_at(0).unwrap().unwrap();
     assert_eq!((range.height(), range.width()), (2, 11));
+}
+
+#[test]
+fn xlsx_oversized_extent_returns_a_range_error() {
+    // issue_693.xlsx holds only A1 and XFD1048576; the implied dense range
+    // cannot be allocated, so the reader must return an error.
+    let mut xlsx: Xlsx<_> = wb("issue_693.xlsx");
+    let res = xlsx.worksheet_range("Sheet1");
+    assert!(
+        matches!(res, Err(calamine::XlsxError::Range(_))),
+        "expected XlsxError::Range, got {res:?}"
+    );
 }
 
 // Test for issue #548. The SST table in the test file has an incorrect unique
@@ -3280,6 +3292,18 @@ fn biff5_formula_ptg_ref_643() {
 }
 
 #[test]
+fn test_xls_truncated_ptgexp() {
+    // Test for xls file with a truncated PtgExp token (array/shared formula)
+    // with 2 bytes instead of 4.
+    let mut excel: Xls<_> = wb("ptgexp-truncated-operand.xls");
+    let range = excel.worksheet_range("Tab 1").unwrap();
+    assert_eq!(range.get_size(), (23, 10));
+
+    let formulas = excel.worksheet_formula("Tab 1").unwrap();
+    assert_eq!(formulas.used_cells().count(), 22);
+}
+
+#[test]
 fn biff5_rich_text_string() {
     // This file uses RSTRING records, apparently produced by ABBYY FineReader.
     let mut wb: Xls<_> = wb("biff5-rich-text-string.xls");
@@ -3649,4 +3673,38 @@ fn xls_empty_string() {
     let mut wb: Xls<_> = wb("empty-string.xls");
     let range = wb.worksheet_range("Sheet1").unwrap();
     assert_eq!(range.get_value((0, 0)), Some(&String("".to_string())));
+}
+
+#[test]
+fn xls_formula_columns_beyond_z() {
+    // Formula column references at/after column AA (index 26) exercise the
+    // column-name rendering and the BIFF8 PtgArea column masking.
+    let mut wb: Xls<_> = wb("xls_formula_columns_beyond_z.xls");
+    let formula = wb.worksheet_formula("Sheet1").unwrap();
+    let mut rows = formula.rows();
+    assert_eq!(rows.next(), Some(&["SUM(AA1:AA3)".to_owned()][..]));
+    assert_eq!(rows.next(), Some(&["AA1+AB1".to_owned()][..]));
+    assert_eq!(rows.next(), None);
+}
+
+#[test]
+fn xls_embedded_cross_sheet_chart_does_not_leak_cells() {
+    // Regression test: the chart on "Report" is a nested substream whose cached
+    // series values (Data!A1:B8) must not leak into the hosting sheet.
+    let mut excel: Xls<_> = wb("xls_cross_sheet_chart.xls");
+    let range = excel.worksheet_range("Report").unwrap();
+
+    assert_eq!(
+        range.get((0, 0)),
+        Some(&Data::String("HEADER TEXT A1".to_string())),
+        "A1 was overwritten by the embedded chart's cached series"
+    );
+    assert_eq!(
+        range.get((5, 0)),
+        Some(&Data::String("LABEL A6".to_string()))
+    );
+    assert_eq!(
+        range.get((5, 2)),
+        Some(&Data::String("VALUE C6".to_string()))
+    );
 }

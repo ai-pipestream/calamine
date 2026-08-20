@@ -31,8 +31,8 @@ use crate::vba::VbaProject;
 #[cfg(feature = "picture")]
 use crate::Picture;
 use crate::{
-    Cell, CellErrorType, Data, Dimensions, HeaderRow, Metadata, Range, Reader, ReaderRef, Sheet,
-    SheetType, SheetVisible, Table,
+    Cell, CellErrorType, Data, Dimensions, HeaderRow, Metadata, Range, RangeError, Reader,
+    ReaderRef, Sheet, SheetType, SheetVisible, Table,
 };
 pub use cells_reader::{
     XlsxCellFormula, XlsxCellFormulaMetadataRecord, XlsxCellReader, XlsxFormulaMetadata,
@@ -152,6 +152,9 @@ pub enum XlsxError {
 
     /// Specified Pivot Table was not found on worksheet.
     PivotTableNotFound(String),
+
+    /// A worksheet range could not be allocated from its cells.
+    Range(RangeError),
 }
 
 from_err!(std::io::Error, XlsxError, Io);
@@ -162,6 +165,7 @@ from_err!(std::num::ParseFloatError, XlsxError, ParseFloat);
 from_err!(std::num::ParseIntError, XlsxError, ParseInt);
 from_err!(quick_xml::encoding::EncodingError, XlsxError, Encoding);
 from_err!(quick_xml::events::attributes::AttrError, XlsxError, XmlAttr);
+from_err!(RangeError, XlsxError, Range);
 
 impl std::fmt::Display for XlsxError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -209,6 +213,7 @@ impl std::fmt::Display for XlsxError {
             XlsxError::PivotTableNotFound(pt) => {
                 write!(f, "Pivot Table '{pt}' was not found on worksheet")
             }
+            XlsxError::Range(e) => write!(f, "{e}"),
         }
     }
 }
@@ -224,6 +229,7 @@ impl std::error::Error for XlsxError {
             XlsxError::ParseInt(e) => Some(e),
             XlsxError::ParseFloat(e) => Some(e),
             XlsxError::Encoding(e) => Some(e),
+            XlsxError::Range(e) => Some(e),
             _ => None,
         }
     }
@@ -2617,7 +2623,7 @@ impl<RS: Read + Seek> Reader<RS> for Xlsx<RS> {
                 cells.push(cell);
             }
         }
-        Ok(Range::from_sparse(cells))
+        Ok(Range::from_sparse(cells)?)
     }
 
     fn worksheets(&mut self) -> Vec<(String, Range<Data>)> {
@@ -2717,7 +2723,7 @@ impl<RS: Read + Seek> ReaderRef<RS> for Xlsx<RS> {
             }
         }
 
-        Ok(Range::from_sparse(cells))
+        Ok(Range::from_sparse(cells)?)
     }
 }
 
@@ -2789,22 +2795,8 @@ pub(crate) fn get_dimension(dimension: &[u8]) -> Result<Dimensions, XlsxError> {
             end: parts[0],
         }),
         2 => {
-            // A `ref` is not required to be ordered, and writers do emit
-            // reversed ones such as `C5:A1`. Normalise the corners so the rest
-            // of the crate can rely on `start <= end`; subtracting them the
-            // other way round underflows, which panics in a debug build and
-            // wraps silently in a release one.
-            let start = (parts[0].0.min(parts[1].0), parts[0].1.min(parts[1].1));
-            let end = (parts[0].0.max(parts[1].0), parts[0].1.max(parts[1].1));
-            let rows = end.0 - start.0;
-            let columns = end.1 - start.1;
-            if rows > MAX_ROWS {
-                warn!("xlsx has more than maximum number of rows ({rows} > {MAX_ROWS})");
-            }
-            if columns > MAX_COLUMNS {
-                warn!("xlsx has more than maximum number of columns ({columns} > {MAX_COLUMNS})");
-            }
-            Ok(Dimensions { start, end })
+            // The `ref` may be in reversed order like `C5:A1`.
+            Ok(Dimensions::new(parts[0], parts[1]))
         }
         len => Err(XlsxError::DimensionCount(len)),
     }
@@ -2826,8 +2818,6 @@ pub(crate) fn get_row(range: &[u8]) -> Result<u32, XlsxError> {
 }
 
 /// Appends one base-26 letter to a 1-based column accumulator.
-///
-/// `offset` is the letter's position in the alphabet, i.e. `c - b'A'`.
 fn push_column_letter(col: u32, offset: u8) -> Result<u32, XlsxError> {
     col.checked_mul(26)
         .and_then(|col| col.checked_add(u32::from(offset) + 1))
@@ -2845,12 +2835,6 @@ fn get_row_and_optional_column(range: &[u8]) -> Result<(u32, Option<u32>), XlsxE
     // (eg: A=1, B=2, ..., Z=26, AA=27, ..., AZ=52, ..., etc)
     let mut col: u32 = 0;
     let mut row: u32 = 0;
-    // Both accumulations below are checked. The reference comes straight out
-    // of the file, and 7 letters or 11 digits are enough to leave `u32`, which
-    // panicked in a debug build and wrapped to an unrelated position in a
-    // release one. A value that merely exceeds the sheet limits is still
-    // accepted, deliberately: writers do not always respect them, so
-    // `get_dimension` warns rather than failing (see #174).
     while i < len {
         match range[i] {
             c @ b'A'..=b'Z' => col = push_column_letter(col, c - b'A')?,
@@ -2878,6 +2862,14 @@ fn get_row_and_optional_column(range: &[u8]) -> Result<(u32, Option<u32>), XlsxE
             c => return Err(XlsxError::Alphanumeric(c)),
         }
         i += 1;
+    }
+
+    // Reject references outside the maximum grid size.
+    if row > MAX_ROWS {
+        return Err(XlsxError::RowNumberOverflow);
+    }
+    if col > MAX_COLUMNS {
+        return Err(XlsxError::ColumnNumberOverflow);
     }
 
     // Convert from 1-based to 0-based (col=0 means no column found)
@@ -3364,14 +3356,9 @@ pub(crate) fn column_number_to_name(num: u32, buf: &mut Vec<u8>) -> Result<(), X
     if num >= MAX_COLUMNS {
         return Err(XlsxError::ColumnNumberOverflow);
     }
-    let start = buf.len();
-    let mut num = num + 1;
-    while num > 0 {
-        let integer = ((num - 1) % 26 + 65) as u8;
-        buf.push(integer);
-        num = (num - 1) / 26;
-    }
-    buf[start..].reverse();
+    let mut digits = [0u8; 6];
+    let len = crate::utils::column_name_digits(num, &mut digits);
+    buf.extend_from_slice(&digits[..len]);
     Ok(())
 }
 
@@ -4036,10 +4023,7 @@ mod tests {
 
     #[test]
     fn test_reversed_dimension_is_normalised() {
-        // ECMA-376 does not require `ref` to be ordered. A reversed one used to
-        // underflow the extent arithmetic: `C5:A1` panicked in a debug build,
-        // and in a release build produced `start: (4, 2), end: (0, 0)`, whose
-        // `len()` was then 18_446_744_056_529_682_435.
+        // A reversed `ref` such as `C5:A1` gives the same `Dimensions` as `A1:C5`.
         let reversed = get_dimension(b"C5:A1").unwrap();
         assert_eq!(
             reversed,
@@ -4063,25 +4047,17 @@ mod tests {
     }
 
     #[test]
-    fn test_degenerate_dimensions_length_is_zero() {
-        // `Dimensions` is public and constructible directly, so `len()` has to
-        // be total rather than relying on `get_dimension` normalising first.
-        assert_eq!(Dimensions::new((4, 2), (0, 0)).len(), 0);
-        assert_eq!(Dimensions::new((0, 2), (4, 0)).len(), 0);
-        assert_eq!(Dimensions::new((4, 0), (0, 2)).len(), 0);
-        // A single cell is still one cell, and a full-width axis does not
-        // overflow the `+ 1`.
-        assert_eq!(Dimensions::new((7, 7), (7, 7)).len(), 1);
-        assert_eq!(Dimensions::new((0, 0), (u32::MAX, 0)).len(), 4_294_967_296);
-    }
-
-    #[test]
-    fn test_cell_reference_overflow_is_an_error() {
-        // A reference comes straight out of the file, so the accumulators have
-        // to be checked. These used to panic in a debug build ("attempt to
-        // multiply with overflow") and wrap in a release one: `ZZZZZZZ`
-        // produced column 4_058_115_285, and `A99999999999` a cell at row
-        // 1_215_752_190, a position that appears nowhere in the file.
+    fn test_reference_beyond_grid_is_an_error() {
+        // One past the grid on either axis is an error, and so is a
+        // reference that does not fit in u32 at all.
+        assert!(matches!(
+            get_row_column(b"XFE1"),
+            Err(XlsxError::ColumnNumberOverflow)
+        ));
+        assert!(matches!(
+            get_row_column(b"A1048577"),
+            Err(XlsxError::RowNumberOverflow)
+        ));
         assert!(matches!(
             get_row_column(b"ZZZZZZZ1"),
             Err(XlsxError::ColumnNumberOverflow)
@@ -4099,14 +4075,28 @@ mod tests {
             Err(XlsxError::RowNumberOverflow)
         ));
 
-        // The widest and tallest legal references still parse, as does the
-        // largest column that fits without overflowing, which is beyond the
-        // sheet limit but is accepted on purpose (#174).
+        // The bottom-right cell of the grid still parses.
         assert_eq!(
             get_row_column(b"XFD1048576").unwrap(),
             (MAX_ROWS - 1, MAX_COLUMNS - 1)
         );
-        assert_eq!(get_row_column(b"ZZZZZZ1").unwrap(), (0, 321_272_405));
+    }
+
+    #[test]
+    fn test_dimensions_new_normalises_order() {
+        let dim = Dimensions::new((4, 2), (0, 0));
+        assert_eq!(
+            dim,
+            Dimensions {
+                start: (0, 0),
+                end: (4, 2),
+            }
+        );
+        assert_eq!(dim.len(), 15);
+        assert_eq!(Dimensions::new((7, 7), (7, 7)).len(), 1);
+
+        // A full axis must not overflow the `+ 1` in `len()`.
+        assert_eq!(Dimensions::new((0, 0), (u32::MAX, 0)).len(), 4_294_967_296);
     }
 
     #[test]
