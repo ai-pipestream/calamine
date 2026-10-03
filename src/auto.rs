@@ -175,6 +175,16 @@ where
             Sheets::Ods(e) => e.pictures_with_metadata(),
         }
     }
+
+    #[cfg(feature = "picture")]
+    fn pictures_iter(&self) -> Box<dyn Iterator<Item = Picture> + '_> {
+        match self {
+            Sheets::Xls(e) => e.pictures_iter(),
+            Sheets::Xlsx(e) => e.pictures_iter(),
+            Sheets::Xlsb(e) => e.pictures_iter(),
+            Sheets::Ods(e) => e.pictures_iter(),
+        }
+    }
 }
 
 impl<RS> ReaderRef<RS> for Sheets<RS>

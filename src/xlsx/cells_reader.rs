@@ -3,6 +3,7 @@
 // Copyright 2016-2026, Johann Tuffe.
 
 use quick_xml::events::{BytesStart, Event};
+use std::collections::HashMap;
 use std::io::{Read, Seek};
 
 use super::{
@@ -187,7 +188,10 @@ where
     buf: Vec<u8>,
     cell_buf: Vec<u8>,
     value_bufs: ValueBufs,
-    formulas: Vec<Option<SharedFormula>>,
+    /// Shared-formula anchors by their `si` index. Keyed rather than indexed:
+    /// `si` comes from the file, and a vector indexed by it would let one
+    /// `si="1000000000000"` reserve terabytes.
+    formulas: HashMap<usize, SharedFormula>,
 }
 
 impl<'a, RS> XlsxCellReader<'a, RS>
@@ -243,7 +247,7 @@ where
             buf: Vec::with_capacity(1024),
             cell_buf: Vec::with_capacity(1024),
             value_bufs: ValueBufs::new(),
-            formulas: Vec::with_capacity(1024),
+            formulas: HashMap::new(),
         })
     }
 
@@ -316,7 +320,7 @@ where
 
     fn read_formula_record(
         xml: &mut XlReader<'_, RS>,
-        formulas: &mut Vec<Option<SharedFormula>>,
+        formulas: &mut HashMap<usize, SharedFormula>,
         e: &BytesStart<'_>,
         pos: (u32, u32),
         expand_shared_derived: bool,
@@ -342,13 +346,13 @@ where
                     let range = get_dimension(res)?;
                     let formula = formula.unwrap_or_default();
                     if expand_shared_derived {
-                        if formulas.len() <= shared_index {
-                            formulas.resize(shared_index + 1, None);
-                        }
-                        formulas[shared_index] = Some(SharedFormula {
-                            formula: formula.clone(),
-                            range,
-                        });
+                        formulas.insert(
+                            shared_index,
+                            SharedFormula {
+                                formula: formula.clone(),
+                                range,
+                            },
+                        );
                     }
                     Ok(Some(FormulaMetadata::Shared {
                         shared_index,
@@ -359,8 +363,7 @@ where
                 None => {
                     let translated_formula = if expand_shared_derived {
                         formulas
-                            .get(shared_index)
-                            .and_then(|template| template.as_ref())
+                            .get(&shared_index)
                             .map(|template| {
                                 expand_shared_formula(&template.formula, template.range.start, pos)
                             })

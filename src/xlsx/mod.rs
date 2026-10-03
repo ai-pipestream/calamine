@@ -37,6 +37,8 @@ use crate::{
 pub use cells_reader::{
     XlsxCellFormula, XlsxCellFormulaMetadataRecord, XlsxCellReader, XlsxFormulaMetadata,
 };
+#[cfg(feature = "picture")]
+use std::sync::Arc;
 
 pub(crate) type XlReader<'a, RS> = XmlReader<BufReader<ZipFile<'a, RS>>>;
 
@@ -273,7 +275,7 @@ pub struct Xlsx<RS> {
     metadata: Metadata,
     /// Pictures
     #[cfg(feature = "picture")]
-    pictures: Option<Vec<Picture>>,
+    pictures: Option<Vec<AnchoredPicture>>,
     /// Merged Regions: Name, Sheet, Merged Dimensions
     merged_regions: Option<Vec<(String, String, Dimensions)>>,
     /// Reader options
@@ -709,7 +711,7 @@ impl<RS: Read + Seek> Xlsx<RS> {
     // Read pictures and their DrawingML/rich-data anchor positions.
     #[cfg(feature = "picture")]
     fn read_pictures(&mut self) -> Result<(), XlsxError> {
-        let mut media: HashMap<String, (String, Vec<u8>)> = HashMap::new();
+        let mut media: HashMap<String, (String, Arc<[u8]>)> = HashMap::new();
         let media_path = format!("{}media", self.xl_path);
         for i in 0..self.zip.len() {
             let mut zfile = self.zip.by_index(i)?;
@@ -726,7 +728,7 @@ impl<RS: Read + Seek> Xlsx<RS> {
                         let ext = ext.to_string();
                         let mut buf: Vec<u8> = Vec::new();
                         zfile.read_to_end(&mut buf)?;
-                        media.insert(norm, (ext, buf));
+                        media.insert(norm, (ext, buf.into()));
                     }
                 }
             }
@@ -736,7 +738,7 @@ impl<RS: Read + Seek> Xlsx<RS> {
             return Ok(());
         }
 
-        let mut pics: Vec<Picture> = Vec::new();
+        let mut pics: Vec<AnchoredPicture> = Vec::new();
 
         // Track which media paths we've already assigned to an anchor.
         let mut seen: HashSet<String> = HashSet::new();
@@ -882,9 +884,9 @@ impl<RS: Read + Seek> Xlsx<RS> {
                                         if let Some(mp) = rid_to_media.get(&current_rid) {
                                             if let Some((ext, data)) = media.get(mp) {
                                                 seen.insert(mp.clone());
-                                                pics.push(Picture {
+                                                pics.push(AnchoredPicture {
                                                     extension: ext.clone(),
-                                                    data: data.clone(),
+                                                    data: Arc::clone(data),
                                                     sheet_name: sheet_name.clone(),
                                                     row: anchor_row,
                                                     col: anchor_col,
@@ -924,9 +926,9 @@ impl<RS: Read + Seek> Xlsx<RS> {
         // Parse any media not matched to an anchor and add with an empty position.
         for (path, (ext, data)) in &media {
             if !seen.contains(path) {
-                pics.push(Picture {
+                pics.push(AnchoredPicture {
                     extension: ext.clone(),
-                    data: data.clone(),
+                    data: Arc::clone(data),
                     sheet_name: String::new(),
                     row: 0,
                     col: 0,
@@ -945,9 +947,9 @@ impl<RS: Read + Seek> Xlsx<RS> {
     #[cfg(feature = "picture")]
     fn read_rich_data_pictures(
         &mut self,
-        media: &HashMap<String, (String, Vec<u8>)>,
+        media: &HashMap<String, (String, Arc<[u8]>)>,
         seen: &mut HashSet<String>,
-        pics: &mut Vec<Picture>,
+        pics: &mut Vec<AnchoredPicture>,
     ) -> Result<(), XlsxError> {
         // Get rId -> normalized media path from richValueRel.xml.rels.
         let mut rid_to_media: HashMap<String, String> = HashMap::new();
@@ -1102,9 +1104,9 @@ impl<RS: Read + Seek> Xlsx<RS> {
                                         if let Some((ext, data)) = media.get(media_path) {
                                             let col = r.map_or(0, col_from_cell_ref);
                                             seen.insert(media_path.clone());
-                                            pics.push(Picture {
+                                            pics.push(AnchoredPicture {
                                                 extension: ext.clone(),
-                                                data: data.clone(),
+                                                data: Arc::clone(data),
                                                 sheet_name: sheet_name.clone(),
                                                 row: current_row,
                                                 col,
@@ -2645,14 +2647,25 @@ impl<RS: Read + Seek> Reader<RS> for Xlsx<RS> {
     fn pictures(&self) -> Option<Vec<(String, Vec<u8>)>> {
         self.pictures.as_ref().map(|pics| {
             pics.iter()
-                .map(|p| (p.extension.clone(), p.data.clone()))
+                .map(|p| (p.extension.clone(), p.data.to_vec()))
                 .collect()
         })
     }
 
     #[cfg(feature = "picture")]
     fn pictures_with_metadata(&self) -> Vec<Picture> {
-        self.pictures.as_deref().unwrap_or(&[]).to_vec()
+        self.pictures_iter().collect()
+    }
+
+    #[cfg(feature = "picture")]
+    fn pictures_iter(&self) -> Box<dyn Iterator<Item = Picture> + '_> {
+        Box::new(
+            self.pictures
+                .as_deref()
+                .unwrap_or(&[])
+                .iter()
+                .map(AnchoredPicture::to_picture),
+        )
     }
 }
 
@@ -2724,6 +2737,40 @@ impl<RS: Read + Seek> ReaderRef<RS> for Xlsx<RS> {
         }
 
         Ok(Range::from_sparse(cells)?)
+    }
+}
+
+/// One picture as the reader holds it: an anchor's metadata over image bytes
+/// shared with every other anchor that embeds the same media.
+///
+/// A drawing may anchor one image any number of times, and rich-data cells
+/// may reference it from every cell of a sheet, each a few bytes of XML. If
+/// every anchor owned a copy, a small image referenced a million times would
+/// be a million copies, allocated while the workbook is still being opened.
+/// Shared, the open costs each distinct image once; a copy is made only when
+/// a caller asks for a [`Picture`].
+#[cfg(feature = "picture")]
+#[derive(Debug, Clone)]
+struct AnchoredPicture {
+    row: u32,
+    col: u32,
+    sheet_name: String,
+    extension: String,
+    data: Arc<[u8]>,
+    name: String,
+}
+
+#[cfg(feature = "picture")]
+impl AnchoredPicture {
+    fn to_picture(&self) -> Picture {
+        Picture {
+            row: self.row,
+            col: self.col,
+            sheet_name: self.sheet_name.clone(),
+            extension: self.extension.clone(),
+            data: self.data.to_vec(),
+            name: self.name.clone(),
+        }
     }
 }
 
@@ -4669,5 +4716,131 @@ mod tests {
         assert_eq!("String 1", &xlsx.strings[0]);
         assert_eq!("String 2", &xlsx.strings[1]);
         assert_eq!("String 3", &xlsx.strings[2]);
+    }
+
+    /// A stored zip of `parts` in memory.
+    fn package(parts: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut zip_writer = ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let options =
+            SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        for (name, body) in parts {
+            zip_writer.start_file(*name, options).unwrap();
+            zip_writer.write_all(body).unwrap();
+        }
+        zip_writer.finish().unwrap().into_inner()
+    }
+
+    const CONTENT_TYPES: &[u8] = br#"<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/></Types>"#;
+    const ROOT_RELS: &[u8] = br#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>"#;
+    const WORKBOOK: &[u8] = br#"<?xml version="1.0"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="S1" sheetId="1" r:id="rId1"/></sheets></workbook>"#;
+    const WORKBOOK_RELS: &[u8] = br#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>"#;
+
+    fn sheet(cells: &str) -> Vec<u8> {
+        format!(r#"<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1">{cells}</row></sheetData></worksheet>"#).into_bytes()
+    }
+
+    fn open(bytes: Vec<u8>) -> Xlsx<std::io::Cursor<Vec<u8>>> {
+        Xlsx::new(std::io::Cursor::new(bytes)).expect("open package")
+    }
+
+    /// Every anchor of one image shares its bytes: the reader holds one copy
+    /// however many anchors, and repeated drawing relationships, embed it.
+    #[cfg(feature = "picture")]
+    #[test]
+    fn anchors_of_one_image_share_its_bytes() {
+        let sheet_rels: String = (0..3)
+            .map(|i| format!(r#"<Relationship Id="rId{i}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" Target="../drawings/drawing1.xml"/>"#))
+            .collect();
+        let sheet_rels = format!(
+            r#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">{sheet_rels}</Relationships>"#
+        );
+        let anchors: String = (0..4)
+            .map(|_| r#"<xdr:oneCellAnchor><xdr:pic><xdr:blipFill><a:blip r:embed="rIdImg"/></xdr:blipFill></xdr:pic></xdr:oneCellAnchor>"#)
+            .collect();
+        let drawing =
+            format!(r#"<xdr:wsDr xmlns:xdr="x" xmlns:a="a" xmlns:r="r">{anchors}</xdr:wsDr>"#);
+        let drawing_rels = br#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rIdImg" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/image1.png"/></Relationships>"#;
+        let image = vec![7u8; 4096];
+        let xlsx = open(package(&[
+            ("[Content_Types].xml", CONTENT_TYPES),
+            ("_rels/.rels", ROOT_RELS),
+            ("xl/workbook.xml", WORKBOOK),
+            ("xl/_rels/workbook.xml.rels", WORKBOOK_RELS),
+            ("xl/worksheets/sheet1.xml", &sheet("")),
+            ("xl/worksheets/_rels/sheet1.xml.rels", sheet_rels.as_bytes()),
+            ("xl/drawings/drawing1.xml", drawing.as_bytes()),
+            ("xl/drawings/_rels/drawing1.xml.rels", drawing_rels),
+            ("xl/media/image1.png", &image),
+        ]));
+
+        let held = xlsx.pictures.as_deref().expect("pictures");
+        assert_eq!(
+            held.len(),
+            12,
+            "three drawing relationships of four anchors"
+        );
+        assert!(
+            held.iter().all(|p| Arc::ptr_eq(&p.data, &held[0].data)),
+            "one allocation behind every anchor"
+        );
+        assert_eq!(Arc::strong_count(&held[0].data), 12);
+
+        let pictures: Vec<Picture> = xlsx.pictures_iter().collect();
+        assert_eq!(pictures.len(), 12);
+        assert!(pictures
+            .iter()
+            .all(|p| p.data == image && p.sheet_name == "S1"));
+        assert_eq!(xlsx.pictures_with_metadata().len(), 12);
+        assert_eq!(xlsx.pictures().expect("pictures").len(), 12);
+    }
+
+    /// Rich-data cells referencing one image share its bytes the same way.
+    #[cfg(feature = "picture")]
+    #[test]
+    fn rich_data_cells_of_one_image_share_its_bytes() {
+        let cells: String = (0..5)
+            .map(|c| format!(r#"<c r="{}1" vm="1"><v>0</v></c>"#, (b'A' + c) as char))
+            .collect();
+        let image = vec![9u8; 4096];
+        let xlsx = open(package(&[
+            ("[Content_Types].xml", CONTENT_TYPES),
+            ("_rels/.rels", ROOT_RELS),
+            ("xl/workbook.xml", WORKBOOK),
+            ("xl/_rels/workbook.xml.rels", WORKBOOK_RELS),
+            ("xl/worksheets/sheet1.xml", &sheet(&cells)),
+            ("xl/richData/_rels/richValueRel.xml.rels", br#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/image1.png"/></Relationships>"#),
+            ("xl/richData/richValueRel.xml", br#"<richValueRels xmlns:r="r"><rel r:id="rId1"/></richValueRels>"#),
+            ("xl/richData/rdrichvalue.xml", br#"<rvData><rv s="0"><v>0</v><v>5</v></rv></rvData>"#),
+            ("xl/media/image1.png", &image),
+        ]));
+
+        let held = xlsx.pictures.as_deref().expect("pictures");
+        assert_eq!(held.len(), 5);
+        assert!(held.iter().all(|p| Arc::ptr_eq(&p.data, &held[0].data)));
+        assert!(xlsx.pictures_iter().all(|p| p.data == image));
+    }
+
+    /// A shared formula's `si` is a key, not a size: an index of a trillion
+    /// costs one entry, where a vector indexed by it would reserve terabytes
+    /// and abort the process.
+    #[test]
+    fn a_huge_shared_formula_index_allocates_nothing() {
+        let cells = r#"<c r="A1"><f t="shared" ref="A1:B1" si="1000000000000">1+1</f></c><c r="B1"><f t="shared" si="1000000000000"/></c>"#;
+        let mut xlsx = open(package(&[
+            ("[Content_Types].xml", CONTENT_TYPES),
+            ("_rels/.rels", ROOT_RELS),
+            ("xl/workbook.xml", WORKBOOK),
+            ("xl/_rels/workbook.xml.rels", WORKBOOK_RELS),
+            ("xl/worksheets/sheet1.xml", &sheet(cells)),
+        ]));
+        let mut reader = xlsx.worksheet_cells_reader("S1").expect("sheet");
+        let mut formulas = Vec::new();
+        while let Some(cell) = reader.next_formula().expect("formula") {
+            formulas.push((cell.get_position(), cell.get_value().clone()));
+        }
+        assert_eq!(
+            formulas,
+            vec![((0, 0), "1+1".to_string()), ((0, 1), "1+1".to_string())]
+        );
     }
 }

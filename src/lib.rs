@@ -465,6 +465,18 @@ where
     fn pictures_with_metadata(&self) -> Vec<Picture> {
         Vec::new()
     }
+
+    /// Iterate over the pictures [`Reader::pictures_with_metadata`] returns,
+    /// copying each one's data only when the iterator reaches it.
+    ///
+    /// `pictures_with_metadata` copies every picture before it returns, and an
+    /// image anchored many times is one copy per anchor. A caller that handles
+    /// one picture at a time can use this instead to hold one copy at a time.
+    #[cfg(feature = "picture")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "picture")))]
+    fn pictures_iter(&self) -> Box<dyn Iterator<Item = Picture> + '_> {
+        Box::new(self.pictures_with_metadata().into_iter())
+    }
 }
 
 /// A trait to share spreadsheets reader functions across different `FileType`s
