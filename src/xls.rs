@@ -822,7 +822,9 @@ fn parse_lbl(
             // BIFF5 and earlier: plain byte string, no flags byte
             encoding.decode_to(&r.data[14..], cch, &mut name, None);
         }
-        Biff::Biff8 => read_unicode_string_no_cch(encoding, &r.data[14..], &cch, &mut name),
+        Biff::Biff8 => {
+            read_unicode_string_no_cch(encoding, &r.data[14..], cch, &mut name)?;
+        }
     }
     let rgce = &r.data[r.data.len() - cce..];
     let formula = parse_defined_names(rgce, biff)?;
@@ -835,7 +837,9 @@ fn parse_extern_sheet(r: &Record<'_>, biff: Biff) -> Vec<Xti> {
             // Single record with cXTI count + array of 6-byte XTI structs
             let cxti = read_u16(r.data) as usize;
             r.data[2..]
-                .chunks_exact(6)
+                .as_chunks::<6>()
+                .0
+                .iter()
                 .take(cxti)
                 .map(|xti| Xti {
                     _isup_book: read_u16(&xti[..2]),
@@ -1094,7 +1098,9 @@ fn parse_dimensions(r: &[u8]) -> Result<Dimensions, XlsError> {
             read_u16(&r[4..6]) as u32,
             read_u16(&r[6..8]) as u32,
         ),
-        14 => (
+        // The BIFF8 record is 14 bytes but some writers add 2 more, which are
+        // ignored.
+        14 | 16 => (
             read_u32(&r[0..4]),
             read_u32(&r[4..8]),
             read_u16(&r[8..10]) as u32,
@@ -1269,8 +1275,35 @@ fn read_dbcs(
     Ok(s)
 }
 
-fn read_unicode_string_no_cch(encoding: &XlsEncoding, buf: &[u8], len: &usize, s: &mut String) {
-    encoding.decode_to(&buf[1..=*len], *len, s, Some(buf[0] & 0x1 != 0));
+/// Reads an `XLUnicodeStringNoCch` of `len` characters and
+/// returns the number of bytes consumed.
+///
+/// The character data is 1 byte per character when `fHighByte` is 0, and
+/// 2 bytes per character (UTF-16LE) when `fHighByte` is 1.
+fn read_unicode_string_no_cch(
+    encoding: &XlsEncoding,
+    buf: &[u8],
+    len: usize,
+    s: &mut String,
+) -> Result<usize, XlsError> {
+    let Some(&flags) = buf.first() else {
+        return Err(XlsError::Len {
+            expected: 1,
+            found: 0,
+            typ: "XLUnicodeStringNoCch",
+        });
+    };
+    let high_byte = flags & 0x1 != 0;
+    let consumed = 1 + if high_byte { 2 * len } else { len };
+    if buf.len() < consumed {
+        return Err(XlsError::Len {
+            expected: consumed,
+            found: buf.len(),
+            typ: "XLUnicodeStringNoCch",
+        });
+    }
+    encoding.decode_to(&buf[1..consumed], len, s, Some(high_byte));
+    Ok(consumed)
 }
 
 struct Record<'a> {
@@ -1596,10 +1629,18 @@ fn parse_formula(
             0x17 => {
                 stack.push(formula.len());
                 formula.push('\"');
-                let cch = rgce[0] as usize;
-                read_unicode_string_no_cch(encoding, &rgce[1..], &cch, &mut formula);
+                // PtgStr: cch (1 byte) followed by an XLUnicodeStringNoCch
+                let Some(&cch) = rgce.first() else {
+                    return Err(XlsError::Len {
+                        expected: 1,
+                        found: 0,
+                        typ: "PtgStr",
+                    });
+                };
+                let consumed =
+                    read_unicode_string_no_cch(encoding, &rgce[1..], cch as usize, &mut formula)?;
                 formula.push('\"');
-                rgce = &rgce[2 + cch..];
+                rgce = &rgce[1 + consumed..];
             }
             0x18 => {
                 rgce = &rgce[5..];

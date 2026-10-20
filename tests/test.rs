@@ -7,7 +7,7 @@ use calamine::Data::{Bool, DateTime, DateTimeIso, DurationIso, Empty, Error, Flo
 use calamine::{
     open_workbook, open_workbook_auto, DataRef, DataType, Dimensions, ExcelDateTime,
     ExcelDateTimeType, HeaderRow, Ods, Range, Reader, ReaderRef, Sheet, SheetType, SheetVisible,
-    Xls, Xlsb, Xlsx, XlsxFormulaMetadata,
+    Xls, XlsError, Xlsb, Xlsx, XlsxFormulaMetadata,
 };
 use calamine::{CellErrorType::*, Data};
 use rstest::rstest;
@@ -370,6 +370,15 @@ fn unescape_excel_xml() {
         range.get_value((0, 0)),
         Some(&String("ABC\r\nDEF".to_string()))
     );
+
+    // Test a file with a formula whose cached string result is escaped.
+    let mut excel: Xlsx<_> = wb("has_x000D_str.xlsx");
+    let range = excel.worksheet_range("Sheet1").unwrap();
+
+    assert_eq!(
+        range.get_value((0, 0)),
+        Some(&String("ABC\r\nDEF".to_string()))
+    );
 }
 
 #[test]
@@ -538,6 +547,22 @@ fn formula_xlsb() {
 
     let formula = excel.worksheet_formula("Sheet1").unwrap();
     range_eq!(formula, [["B1+OneRange".to_string()]]);
+}
+
+#[test]
+fn formula_xls_utf16_string() {
+    // PtgStr operands stored as UTF-16 (fHighByte = 1) take 2 bytes per
+    // character. "舗" (U+8217) is encoded as `17 82`, which used to be misread
+    // as another PtgStr (0x17) of 0x82 characters and panicked.
+    let mut excel: Xls<_> = wb("formula-utf16-string.xls");
+    let range = excel.worksheet_range("Sheet1").unwrap();
+    range_eq!(
+        range,
+        [[String("店舗".to_string()), Float(100.), Float(100.)]]
+    );
+
+    let formula = excel.worksheet_formula("Sheet1").unwrap();
+    range_eq!(formula, [["IF(A1=\"店舗\",B1,0)".to_string()]]);
 }
 
 #[test]
@@ -929,6 +954,83 @@ fn date_xlsx() {
     }
 }
 
+// The first 19 rows use built-in formats 27-36 and 50-58 without explicit
+// definitions. Each row contains 45306, 0.5, and 45306.123456789; the XLS
+// fixture includes integer RK and floating NUMBER records.
+#[rstest]
+#[case("date_east_asian.xlsx", Float(45306.0))]
+#[case("date_east_asian.xls", Int(45306))]
+fn date_east_asian_builtin_formats(#[case] test_file: &str, #[case] general_value: Data) {
+    let mut workbook = open_workbook_auto(test_path(test_file)).unwrap();
+    let range = workbook.worksheet_range_at(0).unwrap().unwrap();
+    let serial_values = [45306.0, 0.5, 45306.123456789];
+
+    for (row, format_id) in (27..=36).chain(50..=58).enumerate() {
+        for (column, value) in serial_values.iter().enumerate() {
+            let expected = DateTime(ExcelDateTime::new(
+                *value,
+                ExcelDateTimeType::DateTime,
+                false,
+            ));
+            assert_eq!(
+                range.get_value((row as u32, column as u32)),
+                Some(&expected),
+                "{test_file}: built-in format {format_id}, column {column}"
+            );
+        }
+    }
+
+    // General and a custom numeric format must preserve ordinary numbers.
+    for row in [19, 27] {
+        assert_eq!(range.get_value((row, 0)), Some(&general_value));
+        assert_eq!(range.get_value((row, 1)), Some(&Float(0.5)));
+        assert_eq!(range.get_value((row, 2)), Some(&Float(45306.123456789)));
+    }
+
+    // Standard formats 14/20/22, Chinese custom dates, and custom clock time
+    // all use the existing DateTime category. Format 46 and [h]:mm:ss are durations.
+    for (row, datetime_type) in [
+        (20, ExcelDateTimeType::DateTime),  // Built-in 14: date.
+        (21, ExcelDateTimeType::DateTime),  // Built-in 20: clock time.
+        (22, ExcelDateTimeType::DateTime),  // Built-in 22: date and time.
+        (23, ExcelDateTimeType::TimeDelta), // Built-in 46: elapsed time.
+        (24, ExcelDateTimeType::DateTime),  // Chinese custom date.
+        (25, ExcelDateTimeType::TimeDelta), // Custom [h]:mm:ss.
+        (26, ExcelDateTimeType::DateTime),  // Custom hh:mm:ss.
+    ] {
+        for (column, value) in serial_values.iter().enumerate() {
+            let expected = DateTime(ExcelDateTime::new(*value, datetime_type, false));
+            assert_eq!(
+                range.get_value((row, column as u32)),
+                Some(&expected),
+                "{test_file}: control row {row}, column {column}"
+            );
+        }
+    }
+}
+
+#[test]
+fn date_east_asian_explicit_formats() {
+    let mut workbook: Xlsx<_> = wb("date_east_asian_explicit.xlsx");
+    let range = workbook.worksheet_range_at(0).unwrap().unwrap();
+
+    for (column, value) in [45306.0, 0.5, 45306.123456789].iter().enumerate() {
+        // Explicit General on ID 27 and numeric format on ID 14 take precedence.
+        for row in [0, 1] {
+            assert_eq!(range.get_value((row, column as u32)), Some(&Float(*value)));
+        }
+        // Explicit date on ID 0 and clock time on ID 32 also take precedence.
+        let expected = DateTime(ExcelDateTime::new(
+            *value,
+            ExcelDateTimeType::DateTime,
+            false,
+        ));
+        for row in [2, 3] {
+            assert_eq!(range.get_value((row, column as u32)), Some(&expected));
+        }
+    }
+}
+
 // Regression test: a custom number format whose `formatCode` contains
 // quoted literal text (e.g. `mmmm" "yyyy`) is stored in styles.xml with
 // `&quot;` XML entity references. The format detection must therefore
@@ -959,6 +1061,15 @@ fn date_xlsx_custom_format_with_quoted_text() {
     assert_eq!(range.get_value((2, 0)), Some(&expected));
     // A4: `[$-411]ggge"年"m"月"d"日";@` (Japanese era)
     assert_eq!(range.get_value((3, 0)), Some(&expected));
+}
+
+#[test]
+fn date_xlsx_1904_extlst() {
+    // A 1904-system workbook whose extLst also contains an <x15:workbookPr>
+    // extension element (which shares the "workbookPr" local name but carries
+    // no date1904 attribute) must still be read on the 1904 epoch. See #706.
+    let xlsx: Xlsx<_> = wb("date_1904_extlst.xlsx");
+    assert!(xlsx.has_1904_epoch());
 }
 
 #[test]
@@ -3534,6 +3645,33 @@ fn test_hyperlinks_xlsx() {
 }
 
 #[test]
+fn test_hyperlinks_xlsx_escaped_attributes() {
+    let mut excel: Xlsx<_> = wb("hyperlinks_escaped.xlsx");
+
+    let hyperlinks = excel
+        .hyperlinks_by_sheet_name("Links")
+        .expect("hyperlinks parse");
+
+    let by_range = |row, col| {
+        hyperlinks
+            .iter()
+            .find(|h| h.range == Dimensions::new((row, col), (row, col)))
+            .unwrap_or_else(|| panic!("no hyperlink at ({row}, {col})"))
+    };
+
+    assert_eq!(
+        by_range(0, 0).target.as_deref(),
+        Some("https://example.com/search?q=a&page=2")
+    );
+
+    let a2 = by_range(1, 0);
+    assert_eq!(a2.tooltip.as_deref(), Some("Rust & Cargo"));
+    assert_eq!(a2.displayed_text.as_deref(), Some("\"Rust\" <home> &amp;"));
+
+    assert_eq!(by_range(2, 0).location.as_deref(), Some("'R&D'!B5"));
+}
+
+#[test]
 fn test_whitespace_trim_inline_str() {
     // inlineStr cells: whitespace trimmed unless xml:space="preserve"
     let mut excel: Xlsx<_> = wb("whitespace_trim.xlsx");
@@ -3668,6 +3806,59 @@ fn test_xlsx_strict_iso_paths() {
 }
 
 #[test]
+fn test_xlsx_workbook_properties() {
+    let mut excel: Xlsx<_> = wb("workbook_properties.xlsx");
+    let props = excel.workbook_properties().expect("workbook properties");
+
+    assert_eq!(props.creator.as_deref(), Some("Test Creator"));
+    assert_eq!(props.last_modified_by.as_deref(), Some("Last Modifier"));
+    assert_eq!(props.created.as_deref(), Some("2024-01-15T08:30:00Z"));
+    assert_eq!(props.modified.as_deref(), Some("2024-06-20T14:22:00Z"));
+    assert_eq!(props.title.as_deref(), Some("Workbook Title"));
+    assert_eq!(props.subject.as_deref(), Some("Test Subject"));
+    assert_eq!(props.description.as_deref(), Some("A test workbook"));
+    assert_eq!(props.keywords.as_deref(), Some("test, calamine"));
+    assert_eq!(props.category.as_deref(), Some("Testing"));
+    assert_eq!(props.content_status.as_deref(), Some("Draft"));
+    assert_eq!(props.revision.as_deref(), Some("3"));
+    assert_eq!(props.version.as_deref(), Some("1.2"));
+    assert_eq!(props.application.as_deref(), Some("Microsoft Excel"));
+    assert_eq!(props.app_version.as_deref(), Some("16.0300"));
+    assert_eq!(props.company.as_deref(), Some("Contoso & Co"));
+    assert_eq!(props.template.as_deref(), Some("Book.xltx"));
+    assert_eq!(props.manager.as_deref(), Some("Jane Doe"));
+}
+
+#[test]
+fn test_xlsx_workbook_properties_missing() {
+    let mut excel: Xlsx<_> = wb("workbook_properties_missing.xlsx");
+    let props = excel.workbook_properties().expect("workbook properties");
+
+    assert!(props.creator.is_none());
+    assert!(props.last_modified_by.is_none());
+    assert!(props.application.is_none());
+    assert!(props.company.is_none());
+}
+
+#[test]
+fn test_xlsb_workbook_properties() {
+    let mut excel: Xlsb<_> = wb("issues.xlsb");
+    let props = excel.workbook_properties().expect("workbook properties");
+
+    assert_eq!(
+        props.creator.as_deref(),
+        Some("Johann Tuffe (jtuffe010814)")
+    );
+    assert_eq!(
+        props.last_modified_by.as_deref(),
+        Some("Johann Tuffe (jtuffe010814)")
+    );
+    assert_eq!(props.application.as_deref(), Some("Microsoft Excel"));
+    assert_eq!(props.app_version.as_deref(), Some("16.0300"));
+    assert_eq!(props.company.as_deref(), Some("SOCIETE GENERALE"));
+}
+
+#[test]
 fn xls_empty_string() {
     // Empty strings should be retained, not converted to None. See issue #678
     let mut wb: Xls<_> = wb("empty-string.xls");
@@ -3707,4 +3898,55 @@ fn xls_embedded_cross_sheet_chart_does_not_leak_cells() {
         range.get((5, 2)),
         Some(&Data::String("VALUE C6".to_string()))
     );
+}
+
+// Test for an xls file with a 16 byte DIMENSIONS record instead of 14 bytes.
+// The file is from the govdocs1 corpus, via the Apache POI test files. See
+// issue #577.
+#[test]
+fn test_xls_dimensions_16_bytes() {
+    let mut excel: Xls<_> = wb("issue_577_dimensions_16_bytes.xls");
+    let range = excel.worksheet_range("Sheet1").unwrap();
+
+    assert_eq!(range.used_cells().count(), 232);
+    assert_eq!(range.get_value((11, 1)), Some(&Float(167943.0)));
+    assert_eq!(range.get_value((35, 0)), Some(&String("TOTAL".to_string())));
+}
+
+// Test that huge FAT and DIFAT sector counts in a CFB header return an error
+// instead of being used as allocation sizes and aborting the process. See
+// issue #714.
+#[test]
+fn test_xls_cfb_huge_sector_counts() {
+    let result = open_workbook::<Xls<_>, _>(test_path("issue_714.xls"));
+    assert!(matches!(result, Err(XlsError::Cfb(_))));
+}
+
+// Test that boolean cells accept 0, 1, false and true, case-insensitively, and
+// that any other value is reported as an error instead of being decoded as
+// true. See issue #724.
+#[test]
+fn test_xlsx_bool_cell_values() {
+    let mut excel: Xlsx<_> = wb("issue_724.xlsx");
+
+    // Reading the range fails on the first invalid boolean, "00" in cell G1.
+    let result = excel.worksheet_range("Sheet1");
+    assert!(matches!(
+        result,
+        Err(calamine::XlsxError::Unrecognized { typ: "boolean cell value", ref val }) if val == "00"
+    ));
+
+    // The valid cells before it decode correctly.
+    let mut cells = excel.worksheet_cells_reader("Sheet1").unwrap();
+
+    for (col, expected) in [false, true, false, true, false, true].iter().enumerate() {
+        let cell = cells.next_cell().unwrap().unwrap();
+        assert_eq!(cell.get_position(), (0, col as u32));
+        assert_eq!(*cell.get_value(), DataRef::Bool(*expected));
+    }
+
+    assert!(matches!(
+        cells.next_cell(),
+        Err(calamine::XlsxError::Unrecognized { .. })
+    ));
 }

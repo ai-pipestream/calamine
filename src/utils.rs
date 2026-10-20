@@ -10,6 +10,7 @@ use std::io::{Read, Seek};
 
 use quick_xml::{escape::resolve_xml_entity, events::BytesRef};
 use zip::read::ZipArchive;
+use zip::result::ZipResult;
 
 const UNICODE_ESCAPE_LENGTH: usize = 7; // Length of _x00HH_.
 
@@ -26,7 +27,9 @@ macro_rules! from_err {
 /// Converts a &[u8] into an iterator of `u32`s
 pub fn to_u32(s: &[u8]) -> impl ExactSizeIterator<Item = u32> + '_ {
     assert_eq!(s.len() % 4, 0);
-    s.chunks_exact(4)
+    s.as_chunks::<4>()
+        .0
+        .iter()
         .map(|data| u32::from_le_bytes([data[0], data[1], data[2], data[3]]))
 }
 
@@ -96,10 +99,10 @@ pub(crate) fn unescape_entity_to_buffer(
     entity: &BytesRef,
     buffer: &mut String,
 ) -> Result<(), quick_xml::Error> {
-    let decoded = entity.decode()?;
+    let decoded = entity.as_ref();
 
     // Handle standard XML entities directly.
-    if let Some(unescaped_xml_entity) = resolve_xml_entity(&decoded) {
+    if let Some(unescaped_xml_entity) = resolve_xml_entity(decoded) {
         buffer.push_str(unescaped_xml_entity);
         return Ok(());
     }
@@ -171,13 +174,16 @@ pub(crate) fn unescape_xml(original: &str) -> Cow<'_, str> {
 }
 
 /// Build a lookup cache mapping lowercased normalized paths to original ZIP entry names.
-pub fn build_zip_path_cache<RS: Read + Seek>(zip: &ZipArchive<RS>) -> HashMap<String, String> {
+pub fn build_zip_path_cache<RS: Read + Seek>(
+    zip: &ZipArchive<RS>,
+) -> ZipResult<HashMap<String, String>> {
     let mut cache = HashMap::with_capacity(zip.len());
     for zip_path in zip.file_names() {
+        let zip_path = zip_path?;
         let normalized = zip_path.replace('\\', "/").to_ascii_lowercase();
         cache.insert(normalized, zip_path.to_string());
     }
-    cache
+    Ok(cache)
 }
 
 /// Look up a path in the cache, falling back to the path itself.
