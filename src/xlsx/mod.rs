@@ -4110,7 +4110,7 @@ mod tests {
     #[test]
     fn test_reversed_dimension_is_normalised() {
         // A reversed `ref` such as `C5:A1` gives the same `Dimensions` as `A1:C5`.
-        let reversed = get_dimension(b"C5:A1").unwrap();
+        let reversed = get_dimension("C5:A1").unwrap();
         assert_eq!(
             reversed,
             Dimensions {
@@ -4118,17 +4118,17 @@ mod tests {
                 end: (4, 2),
             }
         );
-        assert_eq!(reversed, get_dimension(b"A1:C5").unwrap());
+        assert_eq!(reversed, get_dimension("A1:C5").unwrap());
         assert_eq!(reversed.len(), 15);
 
         // Reversed on one axis only.
         assert_eq!(
-            get_dimension(b"A5:C1").unwrap(),
-            get_dimension(b"A1:C5").unwrap()
+            get_dimension("A5:C1").unwrap(),
+            get_dimension("A1:C5").unwrap()
         );
         assert_eq!(
-            get_dimension(b"C1:A5").unwrap(),
-            get_dimension(b"A1:C5").unwrap()
+            get_dimension("C1:A5").unwrap(),
+            get_dimension("A1:C5").unwrap()
         );
     }
 
@@ -4137,33 +4137,33 @@ mod tests {
         // One past the grid on either axis is an error, and so is a
         // reference that does not fit in u32 at all.
         assert!(matches!(
-            get_row_column(b"XFE1"),
+            get_row_column("XFE1"),
             Err(XlsxError::ColumnNumberOverflow)
         ));
         assert!(matches!(
-            get_row_column(b"A1048577"),
+            get_row_column("A1048577"),
             Err(XlsxError::RowNumberOverflow)
         ));
         assert!(matches!(
-            get_row_column(b"ZZZZZZZ1"),
+            get_row_column("ZZZZZZZ1"),
             Err(XlsxError::ColumnNumberOverflow)
         ));
         assert!(matches!(
-            get_row_column(b"A99999999999"),
+            get_row_column("A99999999999"),
             Err(XlsxError::RowNumberOverflow)
         ));
         assert!(matches!(
-            get_dimension(b"A1:ZZZZZZZ1"),
+            get_dimension("A1:ZZZZZZZ1"),
             Err(XlsxError::ColumnNumberOverflow)
         ));
         assert!(matches!(
-            get_dimension(b"A1:A99999999999"),
+            get_dimension("A1:A99999999999"),
             Err(XlsxError::RowNumberOverflow)
         ));
 
         // The bottom-right cell of the grid still parses.
         assert_eq!(
-            get_row_column(b"XFD1048576").unwrap(),
+            get_row_column("XFD1048576").unwrap(),
             (MAX_ROWS - 1, MAX_COLUMNS - 1)
         );
     }
