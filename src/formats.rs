@@ -235,3 +235,95 @@ fn test_is_date_format() {
         CellFormat::DateTime
     );
 }
+
+/// Preserve a style's format code without fabricating locale-dependent built-ins.
+pub(crate) fn number_format(
+    style_id: u32,
+    format_id: u16,
+    custom: Option<&String>,
+    kind: CellFormat,
+) -> crate::NumberFormat {
+    let builtin = match format_id {
+        0 => "General",
+        1 => "0",
+        2 => "0.00",
+        3 => "#,##0",
+        4 => "#,##0.00",
+        5 => "\"$\"#,##0_);(\"$\"#,##0)",
+        6 => "\"$\"#,##0_);[Red](\"$\"#,##0)",
+        7 => "\"$\"#,##0.00_);(\"$\"#,##0.00)",
+        8 => "\"$\"#,##0.00_);[Red](\"$\"#,##0.00)",
+        9 => "0%",
+        10 => "0.00%",
+        11 => "0.00E+00",
+        12 => "# ?/?",
+        13 => "# ??/??",
+        14 => "mm-dd-yy",
+        15 => "d-mmm-yy",
+        16 => "d-mmm",
+        17 => "mmm-yy",
+        18 => "h:mm AM/PM",
+        19 => "h:mm:ss AM/PM",
+        20 => "h:mm",
+        21 => "h:mm:ss",
+        22 => "m/d/yy h:mm",
+        37 => "#,##0 ;(#,##0)",
+        38 => "#,##0 ;[Red](#,##0)",
+        39 => "#,##0.00;(#,##0.00)",
+        40 => "#,##0.00;[Red](#,##0.00)",
+        41 => r#"_(* #,##0_);_(* \(#,##0\);_(* "-"_);_(@_)"#,
+        42 => r#"_("$"* #,##0_);_("$"* \(#,##0\);_("$"* "-"_);_(@_)"#,
+        43 => r#"_(* #,##0.00_);_(* \(#,##0.00\);_(* "-"??_);_(@_)"#,
+        44 => r#"_("$"* #,##0.00_);_("$"* \(#,##0.00\);_("$"* "-"??_);_(@_)"#,
+        45 => "mm:ss",
+        46 => "[h]:mm:ss",
+        47 => "mmss.0",
+        48 => "##0.0E+0",
+        49 => "@",
+        _ => "",
+    };
+    crate::NumberFormat {
+        style_id,
+        format_id,
+        code: custom
+            .cloned()
+            .or_else(|| (!builtin.is_empty()).then(|| builtin.to_owned())),
+        kind: match kind {
+            CellFormat::Other => crate::NumberFormatKind::Other,
+            CellFormat::DateTime => crate::NumberFormatKind::DateTime,
+            CellFormat::TimeDelta => crate::NumberFormatKind::TimeDelta,
+        },
+    }
+}
+
+#[cfg(test)]
+mod preservation_tests {
+    use super::*;
+
+    #[test]
+    fn number_format_sources_keep_custom_text_builtins_and_unknown_ids() {
+        let custom = "[$USD] #,##0.00;[Red](#,##0.00)".to_owned();
+        let format = number_format(4, 164, Some(&custom), CellFormat::Other);
+        assert_eq!(format.code, Some(custom));
+        assert_eq!(format.style_id, 4);
+        assert_eq!(format.format_id, 164);
+        for (id, code) in [
+            (0, "General"),
+            (2, "0.00"),
+            (3, "#,##0"),
+            (10, "0.00%"),
+            (46, "[h]:mm:ss"),
+        ] {
+            assert_eq!(
+                number_format(1, id, None, CellFormat::Other)
+                    .code
+                    .as_deref(),
+                Some(code)
+            );
+        }
+        let locale = number_format(2, 27, None, CellFormat::DateTime);
+        assert_eq!(locale.format_id, 27);
+        assert_eq!(locale.code, None);
+        assert_eq!(locale.kind, crate::NumberFormatKind::DateTime);
+    }
+}

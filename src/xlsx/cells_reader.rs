@@ -181,6 +181,7 @@ where
     xml: XlReader<'a, RS>,
     strings: &'a [String],
     formats: &'a [CellFormat],
+    last_style_id: Option<u32>,
     is_1904: bool,
     dimensions: Dimensions,
     row_index: u32,
@@ -237,6 +238,7 @@ where
             }
         }
         Ok(Self {
+            last_style_id: None,
             xml,
             strings,
             formats,
@@ -257,6 +259,12 @@ where
     }
 
     /// Return the next cell value in XML stream order.
+    /// Style reference of the last returned cell; omitted style means default zero.
+    pub fn style_id(&self) -> Option<u32> {
+        self.last_style_id
+    }
+
+    /// Read the next cached or literal cell value.
     pub fn next_cell(&mut self) -> Result<Option<Cell<DataRef<'a>>>, XlsxError> {
         loop {
             self.buf.clear();
@@ -273,6 +281,7 @@ where
                 Ok(Event::Start(c_element)) if c_element.local_name().as_ref() == "c" => {
                     let (pos_attr, style_attr, type_attr) =
                         get_attrs!(c_element, "r" => r, "s" => s, "t" => t)?;
+                    self.last_style_id = Some(style_attr.unwrap_or("0").parse().unwrap_or(0));
                     let pos = if let Some(range) = pos_attr {
                         let (row, col) = get_row_column(range)?;
                         self.col_index = col;
@@ -433,6 +442,7 @@ where
                 Ok(Event::Start(c_element)) if c_element.local_name().as_ref() == "c" => {
                     let (pos_attr, style_attr, type_attr) =
                         get_attrs!(c_element, "r" => r, "s" => s, "t" => t)?;
+                    self.last_style_id = Some(style_attr.unwrap_or("0").parse().unwrap_or(0));
                     let pos = if let Some(range) = pos_attr {
                         let (row, col) = get_row_column(range)?;
                         self.col_index = col;

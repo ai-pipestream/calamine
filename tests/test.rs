@@ -3950,3 +3950,54 @@ fn test_xlsx_bool_cell_values() {
         Err(calamine::XlsxError::Unrecognized { .. })
     ));
 }
+
+#[test]
+fn declared_table_metadata_retains_header_rectangle_without_decoding_cells() {
+    let mut book: Xlsx<_> = wb("temperature-table.xlsx");
+    let tables = book.declared_tables().unwrap();
+    assert_eq!(tables.len(), 2);
+    assert_eq!(tables[0].name, "Temperature");
+    assert_eq!(
+        tables[0].dimensions,
+        Dimensions {
+            start: (0, 0),
+            end: (2, 1)
+        }
+    );
+    assert_eq!(tables[0].header_row_count, 1);
+    assert_eq!(tables[0].totals_row_count, 0);
+    assert_eq!(tables[0].columns, ["label", "value"]);
+    assert_eq!(tables[1].name, "OtherTable");
+    assert_eq!(
+        book.declared_tables().unwrap().len(),
+        2,
+        "cached access is stable"
+    );
+}
+
+#[test]
+fn incremental_readers_preserve_style_references_alongside_values() {
+    let mut xlsx: Xlsx<_> = wb("date.xlsx");
+    let styles = xlsx.number_formats().to_vec();
+    assert!(!styles.is_empty());
+    let name = xlsx.sheet_names()[0].clone();
+    let mut reader = xlsx.worksheet_cells_reader(&name).unwrap();
+    let mut count = 0;
+    while reader.next_cell_with_formula().unwrap().is_some() {
+        let id = reader.style_id().unwrap();
+        assert_eq!(styles[id as usize].style_id, id);
+        count += 1;
+    }
+    assert!(count > 0);
+    let mut xlsb: Xlsb<_> = wb("date.xlsb");
+    let styles = xlsb.number_formats().to_vec();
+    let name = xlsb.sheet_names()[0].clone();
+    let mut reader = xlsb.worksheet_cells_reader(&name).unwrap();
+    count = 0;
+    while reader.next_cell().unwrap().is_some() {
+        let id = reader.style_id().unwrap();
+        assert_eq!(styles[id as usize].style_id, id);
+        count += 1;
+    }
+    assert!(count > 0);
+}

@@ -2521,3 +2521,44 @@ where
     let data = Data::deserialize(deserializer)?;
     Ok(data.as_datetime().ok_or_else(|| data.to_string()))
 }
+
+/// A declared table rectangle, including header and totals rows, without reading cells.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeclaredTableMetadata {
+    /// Display name unique within the workbook.
+    pub name: String,
+    /// Worksheet containing the table.
+    pub sheet_name: String,
+    /// Full inclusive rectangle as stored in the table part.
+    pub dimensions: Dimensions,
+    /// Header rows included in the rectangle.
+    pub header_row_count: u32,
+    /// Totals rows included in the rectangle.
+    pub totals_row_count: u32,
+    /// Column names in source order.
+    pub columns: Vec<String>,
+}
+
+/// A cell style's number-format source and classification.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NumberFormat {
+    /// Index referenced by worksheet cells.
+    pub style_id: u32,
+    /// Built-in or custom number-format identifier.
+    pub format_id: u16,
+    /// Original custom code or standard built-in code; absent for reserved/localized codes.
+    pub code: Option<String>,
+    /// Date/duration classification used to decode cached values.
+    pub kind: NumberFormatKind,
+}
+
+/// Classification of a number format, matching the reader's value decoding.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum NumberFormatKind {
+    /// General numeric or text formatting.
+    Other,
+    /// Calendar date or clock time.
+    DateTime,
+    /// Elapsed time.
+    TimeDelta,
+}
