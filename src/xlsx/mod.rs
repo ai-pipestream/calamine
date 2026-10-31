@@ -268,6 +268,8 @@ pub struct Xlsx<RS> {
     tables: Tables,
     /// Cell (number) formats
     formats: Vec<CellFormat>,
+    number_formats: Vec<crate::NumberFormat>,
+    declared_tables: Vec<crate::DeclaredTableMetadata>,
     /// 1904 datetime system
     is_1904: bool,
     /// Metadata
@@ -426,6 +428,18 @@ impl<RS: Read + Seek> Xlsx<RS> {
                     inner_buf.clear();
                     match xml.read_event_into(&mut inner_buf) {
                         Ok(Event::Start(e)) if e.local_name().as_ref() == "xf" => {
+                            let id = e.raw_attr("numFmtId")?.unwrap_or("0");
+                            let format_id = id.parse::<u32>().unwrap_or(0);
+                            let kind = number_formats.get(id).map_or_else(
+                                || builtin_format_by_id(id),
+                                |fmt| detect_custom_number_format(fmt),
+                            );
+                            self.number_formats.push(crate::formats::number_format(
+                                self.formats.len() as u32,
+                                format_id,
+                                number_formats.get(id),
+                                kind,
+                            ));
                             self.formats.push(e.raw_attr("numFmtId")?.map_or(
                                 CellFormat::Other,
                                 |val| match number_formats.get(val) {
@@ -659,6 +673,7 @@ impl<RS: Read + Seek> Xlsx<RS> {
     // sheets must be added before this is called!!
     fn read_table_metadata(&mut self) -> Result<(), XlsxError> {
         let mut new_tables = Vec::new();
+        let mut declarations = Vec::new();
         for (sheet_name, sheet_path) in &self.sheets {
             let last_folder_index = sheet_path.rfind('/').expect("should be in a folder");
             let (base_folder, file_name) = sheet_path.split_at(last_folder_index);
@@ -749,11 +764,27 @@ impl<RS: Read + Seek> Xlsx<RS> {
                     }
                 }
                 let mut dims = get_dimension(&table_meta.ref_cells)?;
+                declarations.push(crate::DeclaredTableMetadata {
+                    name: table_meta.display_name.clone(),
+                    sheet_name: sheet_name.clone(),
+                    dimensions: dims,
+                    header_row_count: table_meta.header_row_count,
+                    totals_row_count: table_meta.totals_row_count,
+                    columns: column_names.clone(),
+                });
                 if table_meta.header_row_count != 0 {
-                    dims.start.0 += table_meta.header_row_count;
+                    dims.start.0 = dims
+                        .start
+                        .0
+                        .checked_add(table_meta.header_row_count)
+                        .ok_or(XlsxError::Unexpected("table header row count overflow"))?;
                 }
                 if table_meta.totals_row_count != 0 {
-                    dims.end.0 -= table_meta.header_row_count;
+                    dims.end.0 = dims
+                        .end
+                        .0
+                        .checked_sub(table_meta.totals_row_count)
+                        .ok_or(XlsxError::Unexpected("table totals row count underflow"))?;
                 }
 
                 new_tables.push((
@@ -765,6 +796,7 @@ impl<RS: Read + Seek> Xlsx<RS> {
             }
         }
         self.tables = Some(new_tables);
+        self.declared_tables = declarations;
         Ok(())
     }
 
@@ -1576,6 +1608,18 @@ impl<RS: Read + Seek> Xlsx<RS> {
     /// - [`XlsxError::Xml`].
     ///
     ///
+    /// Table declarations with source rectangles, without decoding worksheet cells.
+    pub fn declared_tables(&mut self) -> Result<&[crate::DeclaredTableMetadata], XlsxError> {
+        self.load_tables()?;
+        Ok(&self.declared_tables)
+    }
+
+    /// Number-format definitions indexed by worksheet style references.
+    pub fn number_formats(&self) -> &[crate::NumberFormat] {
+        &self.number_formats
+    }
+
+    /// Load table declarations without decoding worksheet cells.
     pub fn load_tables(&mut self) -> Result<(), XlsxError> {
         if self.tables.is_none() {
             self.read_table_metadata()
@@ -2615,6 +2659,8 @@ impl<RS: Read + Seek> Reader<RS> for Xlsx<RS> {
             xl_path: "xl/".to_string(),
             strings: Vec::new(),
             formats: Vec::new(),
+            number_formats: Vec::new(),
+            declared_tables: Vec::new(),
             is_1904: false,
             sheets: Vec::new(),
             tables: None,
@@ -4741,6 +4787,8 @@ mod tests {
             sheets: vec![],
             tables: None,
             formats: vec![],
+            number_formats: vec![],
+            declared_tables: vec![],
             is_1904: false,
             metadata: Metadata::default(),
             workbook_properties: None,

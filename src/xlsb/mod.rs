@@ -166,6 +166,7 @@ pub struct Xlsb<RS> {
     strings: Vec<String>,
     /// Cell (number) formats
     formats: Vec<CellFormat>,
+    number_formats: Vec<crate::NumberFormat>,
     is_1904: bool,
     metadata: Metadata,
     /// Workbook document properties, parsed lazily on first access.
@@ -212,6 +213,11 @@ impl<RS: Read + Seek> Xlsb<RS> {
     }
 
     /// MS-XLSB 2.1.7.50 Styles
+    /// Number-format definitions indexed by worksheet style references.
+    pub fn number_formats(&self) -> &[crate::NumberFormat] {
+        &self.number_formats
+    }
+
     fn read_styles(&mut self) -> Result<(), XlsbError> {
         let mut iter =
             match RecordIter::from_zip(&mut self.zip, "xl/styles.bin", &self.zip_path_cache) {
@@ -232,8 +238,7 @@ impl<RS: Read + Seek> Xlsb<RS> {
                         let _ = iter.next_skip_blocks(0x002C, &[], &mut buf)?; // BrtFmt
                         let fmt_code = read_u16(&buf);
                         let fmt_str = wide_str(&buf[2..], &mut 0)?;
-                        number_formats
-                            .insert(fmt_code, detect_custom_number_format(fmt_str.as_ref()));
+                        number_formats.insert(fmt_code, fmt_str.into_owned());
                     }
                 }
                 0x0269 => {
@@ -243,6 +248,18 @@ impl<RS: Read + Seek> Xlsb<RS> {
                     for _ in 0..len {
                         let _ = iter.next_skip_blocks(0x002F, &[], &mut buf)?; // BrtXF
                         let fmt_code = read_u16(&buf[2..4]);
+                        let kind = match builtin_format_by_code(fmt_code) {
+                            CellFormat::Other => number_formats
+                                .get(&fmt_code)
+                                .map_or(CellFormat::Other, |fmt| detect_custom_number_format(fmt)),
+                            v => v,
+                        };
+                        self.number_formats.push(crate::formats::number_format(
+                            self.formats.len() as u32,
+                            u32::from(fmt_code),
+                            number_formats.get(&fmt_code),
+                            kind,
+                        ));
                         match builtin_format_by_code(fmt_code) {
                             CellFormat::DateTime => self.formats.push(CellFormat::DateTime),
                             CellFormat::TimeDelta => self.formats.push(CellFormat::TimeDelta),
@@ -250,7 +267,7 @@ impl<RS: Read + Seek> Xlsb<RS> {
                                 self.formats.push(
                                     number_formats
                                         .get(&fmt_code)
-                                        .copied()
+                                        .map(|fmt| detect_custom_number_format(fmt))
                                         .unwrap_or(CellFormat::Other),
                                 );
                             }
@@ -516,6 +533,7 @@ impl<RS: Read + Seek> Reader<RS> for Xlsb<RS> {
             strings: Vec::new(),
             extern_sheets: Vec::new(),
             formats: Vec::new(),
+            number_formats: Vec::new(),
             is_1904: false,
             metadata: Metadata::default(),
             workbook_properties: None,

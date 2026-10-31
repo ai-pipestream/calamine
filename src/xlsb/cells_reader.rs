@@ -84,6 +84,12 @@ where
         self.dimensions
     }
 
+    /// Style reference of the last returned cell, including the default zero style.
+    pub fn style_id(&self) -> Option<u32> {
+        (self.buf.len() >= 8)
+            .then(|| u32::from_le_bytes([self.buf[4], self.buf[5], self.buf[6], 0]))
+    }
+
     pub fn next_cell(&mut self) -> Result<Option<Cell<DataRef<'a>>>, XlsbError> {
         // loop until end of sheet
         let value = loop {
