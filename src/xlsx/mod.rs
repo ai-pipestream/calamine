@@ -429,7 +429,7 @@ impl<RS: Read + Seek> Xlsx<RS> {
                     match xml.read_event_into(&mut inner_buf) {
                         Ok(Event::Start(e)) if e.local_name().as_ref() == "xf" => {
                             let id = e.raw_attr("numFmtId")?.unwrap_or("0");
-                            let format_id = id.parse::<u16>().unwrap_or(0);
+                            let format_id = id.parse::<u32>().unwrap_or(0);
                             let kind = number_formats.get(id).map_or_else(
                                 || builtin_format_by_id(id),
                                 |fmt| detect_custom_number_format(fmt),

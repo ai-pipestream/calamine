@@ -239,7 +239,7 @@ fn test_is_date_format() {
 /// Preserve a style's format code without fabricating locale-dependent built-ins.
 pub(crate) fn number_format(
     style_id: u32,
-    format_id: u16,
+    format_id: u32,
     custom: Option<&String>,
     kind: CellFormat,
 ) -> crate::NumberFormat {
@@ -303,10 +303,10 @@ mod preservation_tests {
     #[test]
     fn number_format_sources_keep_custom_text_builtins_and_unknown_ids() {
         let custom = "[$USD] #,##0.00;[Red](#,##0.00)".to_owned();
-        let format = number_format(4, 164, Some(&custom), CellFormat::Other);
+        let format = number_format(4, 100_000, Some(&custom), CellFormat::Other);
         assert_eq!(format.code, Some(custom));
         assert_eq!(format.style_id, 4);
-        assert_eq!(format.format_id, 164);
+        assert_eq!(format.format_id, 100_000);
         for (id, code) in [
             (0, "General"),
             (2, "0.00"),

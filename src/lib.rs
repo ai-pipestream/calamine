@@ -2545,7 +2545,7 @@ pub struct NumberFormat {
     /// Index referenced by worksheet cells.
     pub style_id: u32,
     /// Built-in or custom number-format identifier.
-    pub format_id: u16,
+    pub format_id: u32,
     /// Original custom code or standard built-in code; absent for reserved/localized codes.
     pub code: Option<String>,
     /// Date/duration classification used to decode cached values.

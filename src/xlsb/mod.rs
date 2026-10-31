@@ -256,7 +256,7 @@ impl<RS: Read + Seek> Xlsb<RS> {
                         };
                         self.number_formats.push(crate::formats::number_format(
                             self.formats.len() as u32,
-                            fmt_code,
+                            u32::from(fmt_code),
                             number_formats.get(&fmt_code),
                             kind,
                         ));
